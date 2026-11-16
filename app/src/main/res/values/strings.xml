@@ -117,4 +117,5 @@
         <item>All apps bypass by default</item>
         <item>System apps bypass by default</item>
     </string-array>
+    <string name="private_dns_warning">Private DNS is set to a provider: blocking will not work. Turn Private DNS off in the system network settings.</string>
 </resources>

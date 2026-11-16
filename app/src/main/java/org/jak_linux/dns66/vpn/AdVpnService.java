@@ -16,11 +16,13 @@ import android.app.Notification;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
-import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.net.ConnectivityManager;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.Handler;
@@ -39,6 +41,8 @@ import org.jak_linux.dns66.NotificationChannels;
 import org.jak_linux.dns66.R;
 
 import java.lang.ref.WeakReference;
+import java.net.InetAddress;
+import java.util.List;
 
 public class AdVpnService extends VpnService implements Handler.Callback {
 
@@ -72,6 +76,7 @@ public class AdVpnService extends VpnService implements Handler.Callback {
     public static final String VPN_UPDATE_STATUS_EXTRA = "VPN_STATUS";
     private static final int VPN_MSG_STATUS_UPDATE = 0;
     private static final int VPN_MSG_NETWORK_CHANGED = 1;
+    private static final long NETWORK_CHANGE_DEBOUNCE_MS = 500;
     private static final String TAG = "VpnService";
     // TODO: Temporary Hack til refactor is done
     public static int vpnStatus = VPN_STATUS_STOPPED;
@@ -82,12 +87,36 @@ public class AdVpnService extends VpnService implements Handler.Callback {
             handler.sendMessage(handler.obtainMessage(VPN_MSG_STATUS_UPDATE, value, 0));
         }
     });
-    private final BroadcastReceiver connectivityChangedReceiver = new BroadcastReceiver() {
+    /* Watches the networks below the VPN. Anything that happens to them only schedules a
+     * (debounced) check on the main thread, see networkChanged(). */
+    private final ConnectivityManager.NetworkCallback networkCallback = new ConnectivityManager.NetworkCallback() {
+        private void changed() {
+            handler.removeMessages(VPN_MSG_NETWORK_CHANGED);
+            handler.sendEmptyMessageDelayed(VPN_MSG_NETWORK_CHANGED, NETWORK_CHANGE_DEBOUNCE_MS);
+        }
+
         @Override
-        public void onReceive(Context context, Intent intent) {
-            handler.sendMessage(handler.obtainMessage(VPN_MSG_NETWORK_CHANGED, intent));
+        public void onAvailable(Network network) {
+            changed();
+        }
+
+        @Override
+        public void onLost(Network network) {
+            changed();
+        }
+
+        @Override
+        public void onCapabilitiesChanged(Network network, NetworkCapabilities networkCapabilities) {
+            changed();
+        }
+
+        @Override
+        public void onLinkPropertiesChanged(Network network, LinkProperties linkProperties) {
+            changed();
         }
     };
+    /* DNS servers of the underlying network the VPN thread was last (re)started for */
+    private List<InetAddress> underlyingDnsServers = null;
     private final NotificationCompat.Builder notificationBuilder = new NotificationCompat.Builder(this, NotificationChannels.SERVICE_RUNNING)
             .setSmallIcon(R.drawable.ic_state_deny) // TODO: Notification icon
             .setPriority(Notification.PRIORITY_MIN);
@@ -120,7 +149,7 @@ public class AdVpnService extends VpnService implements Handler.Callback {
 
         notificationBuilder.addAction(R.drawable.ic_pause_black_24dp, getString(R.string.notification_action_pause),
                 PendingIntent.getService(this, REQUEST_CODE_PAUSE, new Intent(this, AdVpnService.class)
-                                .putExtra("COMMAND", Command.PAUSE.ordinal()), 0))
+                                .putExtra("COMMAND", Command.PAUSE.ordinal()), PendingIntent.FLAG_IMMUTABLE))
                 .setColor(ContextCompat.getColor(this, R.color.colorPrimaryDark));
     }
 
@@ -155,7 +184,7 @@ public class AdVpnService extends VpnService implements Handler.Callback {
         intent.putExtra("COMMAND", Command.START.ordinal());
         intent.putExtra("NOTIFICATION_INTENT",
                 PendingIntent.getActivity(context, 0,
-                        new Intent(context, MainActivity.class), 0));
+                        new Intent(context, MainActivity.class), PendingIntent.FLAG_IMMUTABLE));
         return intent;
     }
 
@@ -165,7 +194,7 @@ public class AdVpnService extends VpnService implements Handler.Callback {
         intent.putExtra("COMMAND", Command.RESUME.ordinal());
         intent.putExtra("NOTIFICATION_INTENT",
                 PendingIntent.getActivity(context, 0,
-                        new Intent(context, MainActivity.class), 0));
+                        new Intent(context, MainActivity.class), PendingIntent.FLAG_IMMUTABLE));
         return intent;
     }
 
@@ -202,7 +231,7 @@ public class AdVpnService extends VpnService implements Handler.Callback {
                 .setColor(ContextCompat.getColor(this, R.color.colorPrimaryDark))
                 .setContentTitle(getString(R.string.notification_paused_title))
                 .setContentText(getString(R.string.notification_paused_text))
-                .setContentIntent(PendingIntent.getService(this, REQUEST_CODE_START, getResumeIntent(this), PendingIntent.FLAG_ONE_SHOT))
+                .setContentIntent(PendingIntent.getService(this, REQUEST_CODE_START, getResumeIntent(this), PendingIntent.FLAG_ONE_SHOT | PendingIntent.FLAG_IMMUTABLE))
                 .build());
     }
 
@@ -226,7 +255,11 @@ public class AdVpnService extends VpnService implements Handler.Callback {
             notificationBuilder.setContentIntent(notificationIntent);
         updateVpnStatus(VPN_STATUS_STARTING);
 
-        registerReceiver(connectivityChangedReceiver, new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION));
+        underlyingDnsServers = AdVpnThread.getDnsServers(this);
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+        unregisterNetworkCallback();
+        // The default request matches every non-VPN network with internet capability
+        cm.registerNetworkCallback(new NetworkRequest.Builder().build(), networkCallback);
 
         restartVpnThread();
     }
@@ -261,13 +294,18 @@ public class AdVpnService extends VpnService implements Handler.Callback {
         if (vpnThread != null)
             stopVpnThread();
         vpnThread = null;
-        try {
-            unregisterReceiver(connectivityChangedReceiver);
-        } catch (IllegalArgumentException e) {
-            Log.i(TAG, "Ignoring exception on unregistering receiver");
-        }
+        unregisterNetworkCallback();
+        handler.removeMessages(VPN_MSG_NETWORK_CHANGED);
         updateVpnStatus(VPN_STATUS_STOPPED);
         stopSelf();
+    }
+
+    private void unregisterNetworkCallback() {
+        try {
+            ((ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE)).unregisterNetworkCallback(networkCallback);
+        } catch (IllegalArgumentException e) {
+            Log.i(TAG, "Ignoring exception on unregistering network callback");
+        }
     }
 
     @Override
@@ -287,7 +325,7 @@ public class AdVpnService extends VpnService implements Handler.Callback {
                 updateVpnStatus(message.arg1);
                 break;
             case VPN_MSG_NETWORK_CHANGED:
-                connectivityChanged((Intent) message.obj);
+                networkChanged();
                 break;
             default:
                 throw new IllegalArgumentException("Invalid message with what = " + message.what);
@@ -295,20 +333,25 @@ public class AdVpnService extends VpnService implements Handler.Callback {
         return true;
     }
 
-    private void connectivityChanged(Intent intent) {
-        if (intent.getIntExtra(ConnectivityManager.EXTRA_NETWORK_TYPE, 0) == ConnectivityManager.TYPE_VPN) {
-            Log.i(TAG, "Ignoring connectivity changed for our own network");
+    /**
+     * Something changed in the networks below the VPN. The VPN only needs to be rebuilt if
+     * that changed the upstream DNS servers; rebuilding it for every connectivity event
+     * (as we used to) tears down a working VPN and races with the system.
+     */
+    private void networkChanged() {
+        if (vpnThread == null)
+            return;
+        List<InetAddress> dnsServers = AdVpnThread.getDnsServers(this);
+        if (dnsServers.equals(underlyingDnsServers)) {
+            Log.d(TAG, "Network changed, but DNS servers are the same: " + dnsServers);
             return;
         }
-
-        if (!ConnectivityManager.CONNECTIVITY_ACTION.equals(intent.getAction())) {
-            Log.e(TAG, "Got bad intent on connectivity changed " + intent.getAction());
-        }
-        if (intent.getBooleanExtra(ConnectivityManager.EXTRA_NO_CONNECTIVITY, false)) {
+        underlyingDnsServers = dnsServers;
+        if (dnsServers.isEmpty()) {
             Log.i(TAG, "Connectivity changed to no connectivity, wait for a network");
             waitForNetVpn();
         } else {
-            Log.i(TAG, "Network changed, try to reconnect");
+            Log.i(TAG, "Network changed, reconnecting with DNS servers " + dnsServers);
             reconnect();
         }
     }

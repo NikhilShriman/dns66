@@ -88,7 +88,7 @@ public class RuleDatabaseItemUpdateRunnableTest {
         mockTask.configuration.hosts.items.get(0).state = Configuration.Item.STATE_DENY;
         mockTask.configuration.hosts.items.get(0).location = "http://foo";
 
-        when(mockTask, "addError", any(Configuration.Item.class), anyString()).thenCallRealMethod();
+        when(mockTask, "addError", any(Configuration.Item.class), any()).thenCallRealMethod();
         when(mockTask, "addDone", any(Configuration.Item.class)).thenCallRealMethod();
 
         RuleDatabaseItemUpdateRunnable itemUpdateRunnable = mock(RuleDatabaseItemUpdateRunnable.class);
@@ -99,7 +99,7 @@ public class RuleDatabaseItemUpdateRunnableTest {
         when(itemUpdateRunnable, "run").thenCallRealMethod();
         when(itemUpdateRunnable, "shouldDownload").thenCallRealMethod();
         when(mockTask.getCommand(any(Configuration.Item.class))).thenReturn(itemUpdateRunnable);
-        when(itemUpdateRunnable, "downloadFile", any(File.class), any(SingleWriterMultipleReaderFile.class), any(HttpURLConnection.class)).then(downloadCount);
+        when(itemUpdateRunnable, "downloadFile", any(), any(SingleWriterMultipleReaderFile.class), any()).then(downloadCount);
 
 
         // Scenario 1: Validate response fails
@@ -109,9 +109,9 @@ public class RuleDatabaseItemUpdateRunnableTest {
         assertEquals(1, mockTask.done.size());
 
         // Scenario 2: Validate response succeeds
-        when(itemUpdateRunnable.validateResponse(any(HttpURLConnection.class))).thenReturn(true);
-        when(itemUpdateRunnable.getHttpURLConnection(any(File.class), any(SingleWriterMultipleReaderFile.class), any(URL.class))).thenCallRealMethod();
-        when(itemUpdateRunnable.internalOpenHttpConnection(any(URL.class))).thenReturn(connection);
+        when(itemUpdateRunnable.validateResponse(any())).thenReturn(true);
+        when(itemUpdateRunnable.getHttpURLConnection(any(), any(SingleWriterMultipleReaderFile.class), any())).thenCallRealMethod();
+        when(itemUpdateRunnable.internalOpenHttpConnection(any())).thenReturn(connection);
         assertTrue(itemUpdateRunnable.shouldDownload());
         itemUpdateRunnable.run();
         assertEquals(1, downloadCount.numCalls);
@@ -125,7 +125,7 @@ public class RuleDatabaseItemUpdateRunnableTest {
                 throw new IOException("FooBarException");
             }
         };
-        when(itemUpdateRunnable, "downloadFile", any(File.class), any(SingleWriterMultipleReaderFile.class), any(HttpURLConnection.class)).then(downloadExceptionCount);
+        when(itemUpdateRunnable, "downloadFile", any(), any(SingleWriterMultipleReaderFile.class), any()).then(downloadExceptionCount);
         assertTrue(itemUpdateRunnable.shouldDownload());
         itemUpdateRunnable.run();
         assertEquals(1, downloadExceptionCount.numCalls);
@@ -149,7 +149,7 @@ public class RuleDatabaseItemUpdateRunnableTest {
         when(itemUpdateRunnable, "shouldDownload").thenCallRealMethod();
         when(itemUpdateRunnable.parseUri(anyString())).thenReturn(mock(Uri.class));
         CountingAnswer downloadCount = new CountingAnswer(null);
-        when(itemUpdateRunnable, "downloadFile", any(File.class), any(SingleWriterMultipleReaderFile.class), any(HttpURLConnection.class)).then(downloadCount);
+        when(itemUpdateRunnable, "downloadFile", any(File.class), any(SingleWriterMultipleReaderFile.class), any()).then(downloadCount);
         when(mockResolver.openInputStream(any(Uri.class))).thenReturn(mock(InputStream.class));
 
         assertTrue(itemUpdateRunnable.shouldDownload());
@@ -231,9 +231,9 @@ public class RuleDatabaseItemUpdateRunnableTest {
         when(fos, "write", any(byte[].class), anyInt(), anyInt()).then(new Answer<Void>() {
             @Override
             public Void answer(InvocationOnMock invocation) throws Throwable {
-                byte[] buffer = invocation.getArgumentAt(0, byte[].class);
-                int off = invocation.getArgumentAt(1, Integer.class);
-                int len = invocation.getArgumentAt(2, Integer.class);
+                byte[] buffer = invocation.getArgument(0);
+                int off = invocation.getArgument(1);
+                int len = invocation.getArgument(2);
 
                 bos.write(buffer, off, len);
                 return null;
@@ -344,8 +344,8 @@ public class RuleDatabaseItemUpdateRunnableTest {
     public void testGetHttpURLConnection() throws Exception {
         RuleDatabaseItemUpdateRunnable itemUpdateRunnable = mock(RuleDatabaseItemUpdateRunnable.class);
 
-        when(itemUpdateRunnable.getHttpURLConnection(any(File.class), any(SingleWriterMultipleReaderFile.class), any(URL.class))).thenCallRealMethod();
-        when(itemUpdateRunnable.internalOpenHttpConnection(any(URL.class))).thenReturn(connection);
+        when(itemUpdateRunnable.getHttpURLConnection(any(File.class), any(SingleWriterMultipleReaderFile.class), any())).thenCallRealMethod();
+        when(itemUpdateRunnable.internalOpenHttpConnection(any())).thenReturn(connection);
 
         when(singleWriterMultipleReaderFile.openRead()).thenReturn(mock(FileInputStream.class));
 

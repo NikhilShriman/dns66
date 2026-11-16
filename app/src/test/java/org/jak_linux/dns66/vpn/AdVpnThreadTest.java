@@ -1,6 +1,12 @@
 package org.jak_linux.dns66.vpn;
 
 import android.content.pm.PackageManager;
+import android.content.Context;
+import android.net.ConnectivityManager;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkInfo;
 import android.net.VpnService;
 import android.util.Log;
 
@@ -17,6 +23,8 @@ import java.net.Inet4Address;
 import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -60,14 +68,14 @@ public class AdVpnThreadTest {
         when(builder.addDnsServer(anyString())).thenAnswer(new Answer<VpnService.Builder>() {
             @Override
             public VpnService.Builder answer(InvocationOnMock invocation) throws Throwable {
-                serversAdded.add(InetAddress.getByName(invocation.getArgumentAt(0, String.class)));
+                serversAdded.add(InetAddress.getByName(invocation.getArgument(0)));
                 return builder;
             }
         });
         when(builder.addDnsServer(any(InetAddress.class))).thenAnswer(new Answer<VpnService.Builder>() {
             @Override
             public VpnService.Builder answer(InvocationOnMock invocation) throws Throwable {
-                serversAdded.add(invocation.getArgumentAt(0, InetAddress.class));
+                serversAdded.add(invocation.getArgument(0));
                 return builder;
             }
         });
@@ -80,14 +88,14 @@ public class AdVpnThreadTest {
         when(builder.addDisallowedApplication(anyString())).thenAnswer(new Answer<Object>() {
             @Override
             public Object answer(InvocationOnMock invocation) throws Throwable {
-                disallowed.add(invocation.getArgumentAt(0, String.class));
+                disallowed.add(invocation.getArgument(0));
                 return null;
             }
         });
         when(builder.addAllowedApplication(anyString())).thenAnswer(new Answer<Object>() {
             @Override
             public Object answer(InvocationOnMock invocation) throws Throwable {
-                allowed.add(invocation.getArgumentAt(0, String.class));
+                allowed.add(invocation.getArgument(0));
                 return null;
             }
         });
@@ -201,4 +209,65 @@ public class AdVpnThreadTest {
         assertTrue(serversAdded.contains(InetAddress.getByAddress(ipv6Template)));
     }
 
+
+    private Network mockNetwork(ConnectivityManager cm, int type, int transport, boolean validated, String dns) throws Exception {
+        Network nw = mock(Network.class);
+        NetworkInfo ni = mock(NetworkInfo.class);
+        when(ni.isConnected()).thenReturn(true);
+        when(ni.getType()).thenReturn(type);
+        NetworkCapabilities nc = mock(NetworkCapabilities.class);
+        when(nc.hasTransport(transport)).thenReturn(true);
+        when(nc.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)).thenReturn(true);
+        when(nc.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)).thenReturn(validated);
+        LinkProperties lp = mock(LinkProperties.class);
+        when(lp.getDnsServers()).thenReturn(Collections.singletonList(InetAddress.getByName(dns)));
+        when(cm.getNetworkInfo(nw)).thenReturn(ni);
+        when(cm.getNetworkCapabilities(nw)).thenReturn(nc);
+        when(cm.getLinkProperties(nw)).thenReturn(lp);
+        return nw;
+    }
+
+    /**
+     * On Android 12+ the active network of an app covered by a VPN is the VPN itself, so
+     * on reconnect we must not pick up our own (fake) DNS servers as upstream servers.
+     */
+    @Test
+    public void testGetDnsServers_ignoresVpn() throws Exception {
+        ConnectivityManager cm = mock(ConnectivityManager.class);
+        when(service.getSystemService(Context.CONNECTIVITY_SERVICE)).thenReturn(cm);
+
+        Network cell = mockNetwork(cm, ConnectivityManager.TYPE_MOBILE, NetworkCapabilities.TRANSPORT_CELLULAR, true, "10.0.0.1");
+        Network vpn = mockNetwork(cm, ConnectivityManager.TYPE_VPN, NetworkCapabilities.TRANSPORT_VPN, true, "192.0.2.2");
+        Network wifi = mockNetwork(cm, ConnectivityManager.TYPE_WIFI, NetworkCapabilities.TRANSPORT_WIFI, true, "192.168.1.1");
+        NetworkInfo vpnInfo = cm.getNetworkInfo(vpn);
+        when(cm.getActiveNetworkInfo()).thenReturn(vpnInfo);
+        when(cm.getAllNetworks()).thenReturn(new Network[]{cell, vpn, wifi});
+
+        assertEquals(Arrays.asList(InetAddress.getByName("192.168.1.1")), AdVpnThread.getDnsServers(service));
+
+        // Wi-Fi without internet access (captive portal, dead router): the system uses mobile.
+        when(cm.getNetworkCapabilities(wifi).hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)).thenReturn(false);
+        assertEquals(Arrays.asList(InetAddress.getByName("10.0.0.1")), AdVpnThread.getDnsServers(service));
+
+        // No usable network at all
+        when(cm.getAllNetworks()).thenReturn(new Network[]{vpn});
+        assertEquals(Collections.emptyList(), AdVpnThread.getDnsServers(service));
+    }
+
+    @Test
+    public void testRefusedResponse() throws Exception {
+        org.xbill.DNS.Name name = org.xbill.DNS.Name.fromString("example.com.");
+        for (int type : new int[]{org.xbill.DNS.Type.AAAA, org.xbill.DNS.Type.A}) {
+            org.xbill.DNS.Message query = org.xbill.DNS.Message.newQuery(
+                    org.xbill.DNS.Record.newRecord(name, type, org.xbill.DNS.DClass.IN));
+            org.xbill.DNS.Message response = new org.xbill.DNS.Message(AdVpnThread.refusedResponse(query.toWire()));
+            assertEquals(query.getHeader().getID(), response.getHeader().getID());
+            assertTrue(response.getHeader().getFlag(org.xbill.DNS.Flags.QR));
+            assertEquals(query.getQuestion(), response.getQuestion());
+            assertEquals(0, response.getSection(org.xbill.DNS.Section.ANSWER).size());
+            assertEquals(type == org.xbill.DNS.Type.AAAA ? org.xbill.DNS.Rcode.NOERROR : org.xbill.DNS.Rcode.SERVFAIL,
+                    response.getRcode());
+        }
+        assertNull(AdVpnThread.refusedResponse(new byte[]{1, 2, 3}));
+    }
 }

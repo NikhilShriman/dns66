@@ -77,6 +77,9 @@ public class MainActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         NotificationChannels.onCreate(this);
+        // Android 13+: without this the status notification is hidden
+        if (Build.VERSION.SDK_INT >= 33 && savedInstanceState == null)
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 0);
 
         if (savedInstanceState == null || config == null) {
             config = FileHelper.loadCurrentSettings(this);

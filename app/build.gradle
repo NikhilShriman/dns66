@@ -1,12 +1,12 @@
 apply plugin: 'com.android.application'
-apply plugin: "com.hiya.jacoco-android"
 
 android {
-    compileSdkVersion 29
+    namespace "org.jak_linux.dns66"
+    compileSdkVersion 34
     defaultConfig {
         applicationId "org.jak_linux.dns66"
-        minSdkVersion 21
-        targetSdkVersion 29
+        minSdkVersion 23
+        targetSdkVersion 34
         versionCode 29
         versionName "0.6.8"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
@@ -17,14 +17,17 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
     }
-    lintOptions {
+    lint {
         warning "MissingTranslation"
+        abortOnError false
+    }
+    buildFeatures {
+        buildConfig true
     }
     compileOptions {
-        sourceCompatibility = 1.8
-        targetCompatibility = 1.8
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
     }
-    buildToolsVersion = '29.0.3'
 }
 
 dependencies {
@@ -45,13 +48,20 @@ dependencies {
     implementation 'com.google.code.gson:gson:2.8.6'
 
     testImplementation 'junit:junit:4.13.1'
-    testImplementation 'org.mockito:mockito-core:1.10.19'
-    testImplementation ('org.powermock:powermock-api-mockito:1.6.6') {
-        exclude module: 'hamcrest-core'
-        exclude module: 'objenesis'
-    }
-    testImplementation ('org.powermock:powermock-module-junit4:1.6.6') {
-        exclude module: 'hamcrest-core'
-        exclude module: 'objenesis'
-    }
+    testImplementation 'org.mockito:mockito-core:3.12.4'
+    testImplementation 'org.powermock:powermock-api-mockito2:2.0.9'
+    testImplementation 'org.powermock:powermock-module-junit4:2.0.9'
+}
+
+// PowerMock needs reflective access to JDK internals on Java 17+
+tasks.withType(Test).configureEach {
+    jvmArgs '--add-opens=java.base/java.lang=ALL-UNNAMED',
+            '--add-opens=java.base/java.util=ALL-UNNAMED',
+            '--add-opens=java.base/java.io=ALL-UNNAMED',
+            '--add-opens=java.base/java.net=ALL-UNNAMED',
+            '--add-opens=java.base/java.lang.reflect=ALL-UNNAMED',
+            '--add-opens=java.base/java.text=ALL-UNNAMED',
+            '--add-opens=java.base/sun.nio.fs=ALL-UNNAMED',
+            '--add-opens=java.base/java.nio.file=ALL-UNNAMED',
+            '--add-opens=java.base/java.util.concurrent=ALL-UNNAMED'
 }

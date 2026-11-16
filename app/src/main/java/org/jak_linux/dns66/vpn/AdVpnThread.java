@@ -17,8 +17,9 @@ import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.net.ConnectivityManager;
+import android.net.LinkProperties;
 import android.net.Network;
-import android.net.NetworkInfo;
+import android.net.NetworkCapabilities;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
@@ -33,6 +34,10 @@ import org.jak_linux.dns66.Configuration;
 import org.jak_linux.dns66.FileHelper;
 import org.jak_linux.dns66.MainActivity;
 import org.pcap4j.packet.IpPacket;
+import org.xbill.DNS.Flags;
+import org.xbill.DNS.Message;
+import org.xbill.DNS.Rcode;
+import org.xbill.DNS.Type;
 
 import java.io.FileDescriptor;
 import java.io.FileInputStream;
@@ -48,6 +53,7 @@ import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
@@ -90,26 +96,38 @@ class AdVpnThread implements Runnable, DnsPacketProxy.EventLoop {
         this.notify = notify;
     }
 
-    private static List<InetAddress> getDnsServers(Context context) throws VpnNetworkException {
-        Set<InetAddress> known = new HashSet<>();
-        List<InetAddress> out = new ArrayList<>();
-        ConnectivityManager cm = (ConnectivityManager) context.getSystemService(VpnService.CONNECTIVITY_SERVICE);
-        // Seriously, Android? Seriously?
-        NetworkInfo activeInfo = cm.getActiveNetworkInfo();
-        if (activeInfo == null)
-            throw new VpnNetworkException("No DNS Server");
+    /**
+     * Returns the DNS servers of the network below the VPN, or an empty list if there is none.
+     *
+     * We cannot ask for the "active" network: once the VPN is up it is the active network
+     * (Android 12+), and we would pick our own fake DNS servers as upstream. So we pick the
+     * best non-VPN network ourselves: validated beats unvalidated, then Wi-Fi/Ethernet beats
+     * mobile, which is the order the system uses for its default network.
+     */
+    static List<InetAddress> getDnsServers(Context context) {
+        ConnectivityManager cm = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+        Network best = getUnderlyingNetwork(cm);
+        LinkProperties lp = best == null ? null : cm.getLinkProperties(best);
+        // LinkedHashSet: drop duplicates, keep order
+        return lp == null ? new ArrayList<InetAddress>() : new ArrayList<>(new LinkedHashSet<>(lp.getDnsServers()));
+    }
 
+    static Network getUnderlyingNetwork(ConnectivityManager cm) {
+        Network best = null;
+        int bestScore = -1;
         for (Network nw : cm.getAllNetworks()) {
-            NetworkInfo ni = cm.getNetworkInfo(nw);
-            if (ni == null || !ni.isConnected() || ni.getType() != activeInfo.getType()
-                    || ni.getSubtype() != activeInfo.getSubtype())
+            NetworkCapabilities nc = cm.getNetworkCapabilities(nw);
+            if (nc == null || nc.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                    || !nc.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET))
                 continue;
-            for (InetAddress address : cm.getLinkProperties(nw).getDnsServers()) {
-                if (known.add(address))
-                    out.add(address);
+            int score = (nc.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ? 2 : 0)
+                    + (nc.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ? 0 : 1);
+            if (score > bestScore) {
+                best = nw;
+                bestScore = score;
             }
         }
-        return out;
+        return best;
     }
 
     public void startThread() {
@@ -249,7 +267,7 @@ class AdVpnThread implements Runnable, DnsPacketProxy.EventLoop {
             for (WaitingOnSocketPacket wosp : dnsIn) {
                 i++;
                 StructPollfd pollFd = polls[2 + i] = new StructPollfd();
-                pollFd.fd = ParcelFileDescriptor.fromDatagramSocket(wosp.socket).getFileDescriptor();
+                pollFd.fd = wosp.pfd.getFileDescriptor();
                 pollFd.events = (short) OsConstants.POLLIN;
             }
         }
@@ -276,8 +294,11 @@ class AdVpnThread implements Runnable, DnsPacketProxy.EventLoop {
                 if ((polls[i + 2].revents & OsConstants.POLLIN) != 0) {
                     Log.d(TAG, "Read from DNS socket" + wosp.socket);
                     iter.remove();
-                    handleRawDnsResponse(wosp.packet, wosp.socket);
-                    wosp.socket.close();
+                    try {
+                        handleRawDnsResponse(wosp.packet, wosp.socket);
+                    } finally {
+                        wosp.close();
+                    }
                 }
             }
         }
@@ -342,21 +363,49 @@ class AdVpnThread implements Runnable, DnsPacketProxy.EventLoop {
         } catch (IOException e) {
             FileHelper.closeOrWarn(dnsSocket, TAG, "handleDnsRequest: Cannot close socket in error");
             if (e.getCause() instanceof ErrnoException) {
-                ErrnoException errnoExc = (ErrnoException) e.getCause();
-                if ((errnoExc.errno == OsConstants.ENETUNREACH) || (errnoExc.errno == OsConstants.EPERM)) {
+                int errno = ((ErrnoException) e.getCause()).errno;
+                if (errno == OsConstants.ENETUNREACH)
                     throw new VpnNetworkException("Cannot send message:", e);
+                // EPERM is not a dead network: some vendor kernels (seen on OxygenOS 13) refuse
+                // individual queries, e.g. all AAAA queries on Wi-Fi networks without usable
+                // IPv6. Restarting the VPN for that loops forever, so answer the query ourselves.
+                if (errno == OsConstants.EPERM && parsedPacket != null) {
+                    byte[] response = refusedResponse(Arrays.copyOfRange(outPacket.getData(),
+                            outPacket.getOffset(), outPacket.getOffset() + outPacket.getLength()));
+                    Log.i(TAG, "forwardPacket: System refused to send query, answering locally");
+                    if (response != null)
+                        dnsPacketProxy.handleDnsResponse(parsedPacket, response);
+                    return;
                 }
             }
             Log.w(TAG, "handleDnsRequest: Could not send packet to upstream", e);
-            return;
+        }
+    }
+
+    /**
+     * Builds the response for a query the system did not let us send: "no such record" for
+     * AAAA (the name has no usable IPv6 address here), a server failure for anything else.
+     *
+     * @return The response, or null if the query cannot be parsed
+     */
+    static byte[] refusedResponse(byte[] query) {
+        try {
+            Message message = new Message(query);
+            boolean isAaaa = message.getQuestion() != null && message.getQuestion().getType() == Type.AAAA;
+            message.getHeader().setFlag(Flags.QR);
+            message.getHeader().setRcode(isAaaa ? Rcode.NOERROR : Rcode.SERVFAIL);
+            return message.toWire();
+        } catch (IOException e) {
+            return null;
         }
     }
 
     private void handleRawDnsResponse(IpPacket parsedPacket, DatagramSocket dnsSocket) throws IOException {
-        byte[] datagramData = new byte[1024];
+        // Large enough for EDNS responses; a 1024 byte buffer truncated them.
+        byte[] datagramData = new byte[4096];
         DatagramPacket replyPacket = new DatagramPacket(datagramData, datagramData.length);
         dnsSocket.receive(replyPacket);
-        dnsPacketProxy.handleDnsResponse(parsedPacket, datagramData);
+        dnsPacketProxy.handleDnsResponse(parsedPacket, Arrays.copyOf(datagramData, replyPacket.getLength()));
     }
 
     public void queueDeviceWrite(IpPacket ipOutPacket) {
@@ -421,6 +470,8 @@ class AdVpnThread implements Runnable, DnsPacketProxy.EventLoop {
 
         // Get the current DNS servers before starting the VPN
         List<InetAddress> dnsServers = getDnsServers(vpnService);
+        if (dnsServers.isEmpty())
+            throw new VpnNetworkException("No DNS Server");
         Log.i(TAG, "Got DNS servers = " + dnsServers);
 
         // Configure a builder while parsing the parameters.
@@ -508,7 +559,7 @@ class AdVpnThread implements Runnable, DnsPacketProxy.EventLoop {
                 .setSession("DNS66")
                 .setConfigureIntent(
                         PendingIntent.getActivity(vpnService, 1, new Intent(vpnService, MainActivity.class),
-                                PendingIntent.FLAG_CANCEL_CURRENT)).establish();
+                                PendingIntent.FLAG_CANCEL_CURRENT | PendingIntent.FLAG_IMMUTABLE)).establish();
         Log.i(TAG, "Configured");
         return pfd;
     }
@@ -551,13 +602,22 @@ class AdVpnThread implements Runnable, DnsPacketProxy.EventLoop {
      */
     private static class WaitingOnSocketPacket {
         final DatagramSocket socket;
+        // Duplicate of the socket's fd for poll(). Created once and closed with the socket;
+        // creating one per poll() leaked fds until "Too many open files".
+        final ParcelFileDescriptor pfd;
         final IpPacket packet;
         private final long time;
 
         WaitingOnSocketPacket(DatagramSocket socket, IpPacket packet) {
             this.socket = socket;
+            this.pfd = ParcelFileDescriptor.fromDatagramSocket(socket);
             this.packet = packet;
             this.time = System.currentTimeMillis();
+        }
+
+        void close() {
+            FileHelper.closeOrWarn(pfd, TAG, "Cannot close poll fd");
+            socket.close();
         }
 
         long ageSeconds() {
@@ -574,12 +634,12 @@ class AdVpnThread implements Runnable, DnsPacketProxy.EventLoop {
         void add(WaitingOnSocketPacket wosp) {
             if (list.size() > DNS_MAXIMUM_WAITING) {
                 Log.d(TAG, "Dropping socket due to space constraints: " + list.element().socket);
-                list.element().socket.close();
+                list.element().close();
                 list.remove();
             }
             while (!list.isEmpty() && list.element().ageSeconds() > DNS_TIMEOUT_SEC) {
                 Log.d(TAG, "Timeout on socket " + list.element().socket);
-                list.element().socket.close();
+                list.element().close();
                 list.remove();
             }
             list.add(wosp);

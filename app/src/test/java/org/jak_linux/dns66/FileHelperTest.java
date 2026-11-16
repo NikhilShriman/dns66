@@ -150,7 +150,7 @@ public class FileHelperTest {
 
         assertSame(mockConfig, FileHelper.loadDefaultSettings(mockContext));
 
-        Mockito.verify(mockAssets.open(anyString()));
+        Mockito.verify(mockAssets).open(anyString());
     }
 
     @Test
@@ -158,7 +158,7 @@ public class FileHelperTest {
     public void testPoll_retryInterrupt() throws Exception {
         mockStatic(Log.class);
         mockStatic(Os.class);
-        when(Os.poll(any(StructPollfd[].class), anyInt())).then(new Answer<Integer>() {
+        when(Os.poll(any(), anyInt())).then(new Answer<Integer>() {
             @Override
             public Integer answer(InvocationOnMock invocation) throws Throwable {
                 // First try fails with EINTR, seconds returns success.
@@ -198,7 +198,7 @@ public class FileHelperTest {
         // Hack around it so we can test that aborting the loop works.
         final ErrnoException e = new ErrnoException("foo", 42);
         e.getClass().getDeclaredField("errno").setInt(e, 42);
-        when(Os.poll(any(StructPollfd[].class), anyInt())).then(new Answer<Integer>() {
+        when(Os.poll(any(), anyInt())).then(new Answer<Integer>() {
             @Override
             public Integer answer(InvocationOnMock invocation) throws Throwable {
                 testResult++;
@@ -221,7 +221,7 @@ public class FileHelperTest {
     public void testPoll_success() throws Exception {
         mockStatic(Log.class);
         mockStatic(Os.class);
-        when(Os.poll(any(StructPollfd[].class), anyInt())).then(new CountingAnswer(42));
+        when(Os.poll(any(), anyInt())).then(new CountingAnswer(42));
         assertEquals(42, FileHelper.poll(null, 0));
         assertEquals(1, testResult);
     }
@@ -230,7 +230,7 @@ public class FileHelperTest {
     @Test
     @PrepareForTest({Log.class, Os.class})
     public void testCloseOrWarn_fileDescriptor() throws Exception {
-        FileDescriptor fd = mock(FileDescriptor.class);
+        FileDescriptor fd = new FileDescriptor();
         mockStatic(Log.class);
         mockStatic(Os.class);
         when(Log.e(anyString(), anyString(), any(Throwable.class))).then(new CountingAnswer(null));

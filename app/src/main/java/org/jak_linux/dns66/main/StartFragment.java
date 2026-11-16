@@ -249,11 +249,14 @@ public class StartFragment extends Fragment {
         }
         if (requestCode == REQUEST_START_VPN && resultCode == RESULT_OK) {
             Log.d("MainActivity", "onActivityResult: Starting service");
+            // Private DNS with a provider hostname sends DNS over TLS, bypassing us (issue 383)
+            if ("hostname".equals(android.provider.Settings.Global.getString(getContext().getContentResolver(), "private_dns_mode")))
+                Toast.makeText(getContext(), R.string.private_dns_warning, Toast.LENGTH_LONG).show();
             Intent intent = new Intent(getContext(), AdVpnService.class);
             intent.putExtra("COMMAND", Command.START.ordinal());
             intent.putExtra("NOTIFICATION_INTENT",
                     PendingIntent.getActivity(getContext(), 0,
-                            new Intent(getContext(), MainActivity.class), 0));
+                            new Intent(getContext(), MainActivity.class), PendingIntent.FLAG_IMMUTABLE));
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 getContext().startForegroundService(intent);
             } else {
